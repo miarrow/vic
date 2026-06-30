@@ -7,7 +7,7 @@
 
 // Auth
 //@arg vg_service_account_json string Vertex Service Account JSON (전체 JSON 붙여넣기) [필수]
-//@arg vg_location string Location (예: us-central1, asia-northeast1, global) [필수, 기본값 us-central1]
+//@arg vg_location string Location (예: us-central1, asia-northeast1, global) [필수, 기본값 us-central1] - 최신 Gemini 3.x 모델은 프로젝트에 따라 특정 리전에서 404가 날 수 있습니다. 그 경우 "global"로 설정해보세요.
 //@arg vg_token_bridge_url string Token Bridge URL (선택사항 - CORS 우회용 Worker URL)
 
 // Model
