@@ -641,6 +641,56 @@
 
   // ─── Dynamic Model Fetch ──────────────────────────────────────────────────────
 
+  // The publisher model catalog (`/v1beta1/publishers/google/models`) lists
+  // every model Google has ever published, including ones a given project/
+  // region has no access to (e.g. restricted previews). Listing alone is not
+  // proof of availability, so each candidate is probed against the actual
+  // per-project endpoint the chat fetcher will use, and only models that
+  // respond (not 404/403) are kept. Probes use minimal bodies that error out
+  // on real validation (not 404) without doing real generation work, except
+  // for plain gemini text calls where a 1-token reply is cheap enough to do
+  // for real.
+  async function probeModelAvailable(accessToken, baseUrl, project, location, id) {
+    try {
+      if (isImagenId(id)) {
+        const url = `${baseUrl}/v1/projects/${project}/locations/${location}/publishers/google/models/${id}:predict`;
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ instances: [] }),
+        });
+        // 404/403 = model not found or no access. Any other status (e.g. 400
+        // invalid argument for the empty instances) means the model exists.
+        return res.status !== 404 && res.status !== 403;
+      }
+      const url = `${baseUrl}/v1/projects/${project}/locations/${location}/publishers/google/models/${id}:generateContent`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: "hi" }] }],
+          generationConfig: { maxOutputTokens: 1 },
+        }),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  async function probeAll(accessToken, baseUrl, project, location, candidates, concurrency = 5) {
+    const results = new Array(candidates.length);
+    let next = 0;
+    async function worker() {
+      while (next < candidates.length) {
+        const i = next++;
+        results[i] = await probeModelAvailable(accessToken, baseUrl, project, location, candidates[i].id);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, candidates.length) }, worker));
+    return candidates.filter((_, i) => results[i]);
+  }
+
   async function fetchDynamicModels() {
     try {
       const saJson    = await getArg("vg_service_account_json", "");
@@ -703,9 +753,13 @@
         }
       }
 
-      if (filtered.length > 0) {
-        try { await Risuai.setArgument("vg_dynamic_models", JSON.stringify(filtered)); } catch {}
-        return filtered;
+      if (filtered.length === 0) return null;
+
+      const available = await probeAll(accessToken, baseUrl, sa.project_id, location, filtered);
+
+      if (available.length > 0) {
+        try { await Risuai.setArgument("vg_dynamic_models", JSON.stringify(available)); } catch {}
+        return available;
       }
       return null;
     } catch (e) {
