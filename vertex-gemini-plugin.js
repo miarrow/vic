@@ -665,7 +665,9 @@
 
       while (page < 30) {
         page++;
-        let url = `${baseUrl}/v1/publishers/google/models?pageSize=100`;
+        // NOTE: publisher model listing only exists under v1beta1, not v1.
+        // v1 returns a bare 404 for this path.
+        let url = `${baseUrl}/v1beta1/publishers/google/models?pageSize=100`;
         if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
 
         let res;
@@ -679,7 +681,8 @@
 
         if (!res.ok) break;
         const data = await res.json();
-        if (data.models) models.push(...data.models);
+        // Response field is `publisherModels`, not `models`.
+        if (data.publisherModels) models.push(...data.publisherModels);
         if (!data.nextPageToken) break;
         pageToken = data.nextPageToken;
       }
@@ -689,17 +692,13 @@
         const id = (m.name || "").split("/").pop();
         if (!id) continue;
 
-        const isImageModel = id.startsWith("imagen-3") || id.startsWith("imagen-4");
+        const isImageModel = id.startsWith("imagen-");
         const isGeminiLatest = id.startsWith("gemini-") && (() => {
           const match = id.match(/^gemini-(\d+)/);
           return match && parseInt(match[1], 10) >= 3;
         })();
 
-        const supports = !m.supportedActions
-          || m.supportedActions.includes("generateContent")
-          || m.supportedActions.includes("predict");
-
-        if ((isGeminiLatest || isImageModel) && supports) {
+        if (isGeminiLatest || isImageModel) {
           filtered.push({ id, name: m.displayName || id });
         }
       }
