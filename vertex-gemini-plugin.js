@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.0.2
+//@version 1.0.3
 
 // ===== Settings Arguments =====
 
@@ -116,6 +116,38 @@
     const v = await getArg(key, "");
     if (v === "") return fallback;
     return v === "true" || v === "1" || v === true;
+  }
+
+  // ─── Debug/Diagnostics Helpers ────────────────────────────────────────────────
+
+  // Tracks every model this session actually handed to Risuai.addProvider,
+  // so the diagnostics panel can show ground truth instead of guessing.
+  const _registeredModels = [];
+
+  // Never print secrets raw - only enough to eyeball "is this the right one".
+  function redact(s, keep = 6) {
+    if (!s) return "(비어 있음)";
+    const str = String(s);
+    return str.length <= keep * 2 ? "*".repeat(str.length) : `${str.slice(0, keep)}...${str.slice(-keep)} (길이 ${str.length})`;
+  }
+
+  // Runs fn() with a timeout and never throws - always resolves to a
+  // {ok, detail, ms} result, so one bad/hanging step can't take down the
+  // rest of a diagnostic run.
+  async function runStep(name, fn, timeoutMs = 20000) {
+    const start = Date.now();
+    try {
+      const result = await Promise.race([
+        (async () => fn())(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error(`시간 초과 (${timeoutMs}ms)`)), timeoutMs)),
+      ]);
+      return { name, ok: true, detail: (result === undefined || result === null) ? "" : String(result), ms: Date.now() - start };
+    } catch (e) {
+      let msg;
+      try { msg = (e && (e.stack || e.message)) ? (e.stack || e.message) : JSON.stringify(e); }
+      catch { msg = String(e); }
+      return { name, ok: false, detail: msg, ms: Date.now() - start };
+    }
   }
 
   function parseFloat2(s, fallback) {
@@ -782,6 +814,7 @@
 
   async function registerModel(model) {
     const displayName = `🔷 ${model.name}`;
+    _registeredModels.push({ id: model.id, name: model.name, displayName });
     await Risuai.addProvider(
       displayName,
       async (args, abortSignal) => {
@@ -804,6 +837,7 @@
   }
 
   async function registerAllModels(models) {
+    _registeredModels.length = 0;
     let registered = 0;
     for (const model of models) {
       try {
@@ -827,6 +861,205 @@
 
     log(`✓ ${registered}개 모델을 RisuAI에 등록했습니다.`);
     return registered;
+  }
+
+  // ─── Diagnostics ──────────────────────────────────────────────────────────────
+
+  // Runs a battery of isolated, self-timing checks against the user's real
+  // environment and streams results into the given <textarea id="vg-diag-output">
+  // as each one finishes. Every step is wrapped by runStep, so a hung fetch or
+  // an unexpected throw can never prevent the remaining steps from running.
+  // ctx carries forward whatever earlier steps managed to produce (sa, token,
+  // etc.) so later steps can reuse it, but every step re-checks ctx itself
+  // and degrades gracefully instead of assuming a prior step succeeded.
+  async function runDiagnostics(root, diagModelId) {
+    const out = root.querySelector("#vg-diag-output");
+    const ctx = {};
+    const lines = [];
+    let stepNum = 0;
+
+    function append(line) {
+      lines.push(line);
+      if (out) {
+        out.value = lines.join("\n");
+        out.scrollTop = out.scrollHeight;
+      }
+    }
+
+    async function step(name, fn, timeoutMs) {
+      stepNum++;
+      append(`\n[${stepNum}] ${name} — 실행 중...`);
+      const r = await runStep(name, fn, timeoutMs);
+      lines[lines.length - 1] = `[${stepNum}] ${name} — ${r.ok ? "✅ 성공" : "❌ 실패"} (${r.ms}ms)`;
+      if (r.detail) append(String(r.detail).split("\n").map(l => "    " + l).join("\n"));
+      if (out) { out.value = lines.join("\n"); out.scrollTop = out.scrollHeight; }
+      return r;
+    }
+
+    try {
+      append(`=== 🔷 Vertex Gemini 종합 진단 시작 (${new Date().toISOString()}) ===`);
+
+      await step("환경 체크", async () => {
+        const info = [
+          `Risuai 객체: ${typeof Risuai}`,
+          `Risuai.nativeFetch: ${typeof Risuai?.nativeFetch}`,
+          `Risuai.addProvider: ${typeof Risuai?.addProvider}`,
+          `Risuai.getArgument/setArgument: ${typeof Risuai?.getArgument}/${typeof Risuai?.setArgument}`,
+          `crypto.subtle: ${typeof crypto?.subtle}`,
+          `현재 세션에서 등록된 모델 수: ${_registeredModels.length}`,
+        ];
+        return info.join("\n");
+      });
+
+      await step("설정값 스냅샷", async () => {
+        const saRaw = await getArg("vg_service_account_json", "");
+        let saSummary = "(비어 있음)";
+        if (saRaw.trim()) {
+          try {
+            const parsed = JSON.parse(saRaw);
+            saSummary = [
+              `type: ${parsed.type}`,
+              `project_id: ${parsed.project_id}`,
+              `client_email: ${parsed.client_email}`,
+              `private_key 존재: ${!!parsed.private_key} (길이 ${parsed.private_key ? parsed.private_key.length : 0})`,
+            ].join(", ");
+          } catch (e) {
+            saSummary = `JSON 파싱 불가: ${e.message}`;
+          }
+        }
+        const other = [
+          `vg_service_account_json: ${saSummary}`,
+          `vg_location: ${await getArg("vg_location", "(기본값 us-central1)")}`,
+          `vg_token_bridge_url: ${redact(await getArg("vg_token_bridge_url", ""), 10)}`,
+          `vg_custom_model: ${await getArg("vg_custom_model", "(없음)")}`,
+          `vg_streaming: ${await getArg("vg_streaming", "(기본값 true)")}`,
+          `vg_image_mode: ${await getArg("vg_image_mode", "(기본값 none)")}`,
+          `vg_dynamic_models 캐시: ${(await getArg("vg_dynamic_models", "")).slice(0, 300) || "(없음)"}`,
+        ];
+        return other.join("\n");
+      });
+
+      await step("SA JSON 파싱", async () => {
+        const saRaw = await getArg("vg_service_account_json", "");
+        const sa = parseSA(saRaw);
+        ctx.sa = sa;
+        return `project_id=${sa.project_id}, client_email=${sa.client_email}, private_key 길이=${sa.private_key.length}`;
+      });
+
+      await step("JWT 서명 + 토큰 교환 (getAccessToken)", async () => {
+        const saRaw = await getArg("vg_service_account_json", "");
+        const bridgeUrl = (await getArg("vg_token_bridge_url", "")).trim();
+        const token = await getAccessToken(saRaw, bridgeUrl || undefined);
+        ctx.accessToken = token;
+        return `토큰 획득 성공: ${redact(token, 8)}`;
+      });
+
+      await step("nativeFetch 원시 동작 확인 (인증 없는 요청)", async () => {
+        const testUrl = "https://www.google.com/generate_204";
+        let res;
+        try {
+          res = await Risuai.nativeFetch(testUrl, { method: "GET" });
+        } catch (e) {
+          throw new Error(`Risuai.nativeFetch 자체가 실패함: ${e.message || e}. RisuAI 플러그인 sandbox의 네트워크 권한 문제일 수 있습니다.`);
+        }
+        return `nativeFetch 응답 status=${res.status} (네트워크 경로 자체는 정상 동작)`;
+      });
+
+      const location = (await getArg("vg_location", "us-central1")).trim() || "us-central1";
+      const baseUrl = location === "global" ? "https://aiplatform.googleapis.com" : `https://${location}-aiplatform.googleapis.com`;
+      ctx.location = location;
+      ctx.baseUrl = baseUrl;
+
+      await step(`동적 모델 목록 조회 (location=${location})`, async () => {
+        if (!ctx.accessToken) throw new Error("이전 단계(토큰 교환)가 실패해서 건너뜁니다.");
+        const url = `${baseUrl}/v1beta1/publishers/google/models?pageSize=100`;
+        let res;
+        try { res = await Risuai.nativeFetch(url, { method: "GET", headers: { Authorization: `Bearer ${ctx.accessToken}` } }); }
+        catch (e) { res = await fetch(url, { method: "GET", headers: { Authorization: `Bearer ${ctx.accessToken}` } }); }
+        const bodyText = await res.text();
+        if (!res.ok) throw new Error(`status=${res.status}, body=${bodyText.slice(0, 500)}`);
+        let data;
+        try { data = JSON.parse(bodyText); } catch { throw new Error(`JSON 파싱 실패: ${bodyText.slice(0, 300)}`); }
+        const models = data.publisherModels || [];
+        ctx.listedModels = models;
+        const ids = models.map(m => (m.name || "").split("/").pop());
+        return `status=${res.status}, 총 ${models.length}개 모델 카탈로그에서 확인. 예시: ${ids.slice(0, 8).join(", ")}`;
+      });
+
+      await step("모델 가용성 프로브 테스트 (대표 모델 몇 개)", async () => {
+        if (!ctx.accessToken || !ctx.sa) throw new Error("이전 단계(토큰/SA 파싱)가 실패해서 건너뜁니다.");
+        const candidates = [];
+        if (diagModelId) candidates.push(diagModelId);
+        candidates.push("gemini-2.5-flash", "gemini-3-flash-preview", "imagen-4.0-generate-001");
+        const results = [];
+        for (const id of [...new Set(candidates)]) {
+          const available = await probeModelAvailable(ctx.accessToken, baseUrl, ctx.sa.project_id, location, id);
+          results.push(`${id}: ${available ? "✅ 사용 가능" : "❌ 사용 불가/404"}`);
+        }
+        return results.join("\n");
+      });
+
+      const chatModelId = (diagModelId || "").trim() || "gemini-2.5-flash";
+      const testArgs = {
+        prompt_chat: [{ role: "user", content: "디버그 테스트 메시지입니다. 'OK'라고만 답해주세요." }],
+        temperature: 0.1,
+        max_tokens: 32,
+      };
+
+      await step(`비스트리밍 채팅 왕복 테스트 (모델: ${chatModelId})`, async () => {
+        if (!ctx.accessToken || !ctx.sa) throw new Error("이전 단계(토큰/SA 파싱)가 실패해서 건너뜁니다.");
+        const modelPath = `${baseUrl}/v1/projects/${ctx.sa.project_id}/locations/${location}/publishers/google/models/${chatModelId}`;
+        const { contents, systemParts } = convertMessagesToGemini(testArgs.prompt_chat, true);
+        const genConfig = await buildGenerationConfig(testArgs);
+        const safetySettings = await buildSafetySettings();
+        const body = { contents, generationConfig: genConfig };
+        if (systemParts.length > 0) body.systemInstruction = { parts: systemParts };
+        if (safetySettings.length > 0) body.safetySettings = safetySettings;
+        const result = await callGeminiNonStream(modelPath, { "Content-Type": "application/json", Authorization: `Bearer ${ctx.accessToken}` }, JSON.stringify(body), undefined, genConfig);
+        if (!result.success) throw new Error(`실패 응답: ${result.content}`);
+        return `성공. 응답: ${String(result.content).slice(0, 300)}`;
+      });
+
+      await step(`스트리밍 채팅 왕복 테스트 (모델: ${chatModelId})`, async () => {
+        if (!ctx.accessToken || !ctx.sa) throw new Error("이전 단계(토큰/SA 파싱)가 실패해서 건너뜁니다.");
+        const modelPath = `${baseUrl}/v1/projects/${ctx.sa.project_id}/locations/${location}/publishers/google/models/${chatModelId}`;
+        const { contents, systemParts } = convertMessagesToGemini(testArgs.prompt_chat, true);
+        const genConfig = await buildGenerationConfig(testArgs);
+        const headers = { "Content-Type": "application/json", Authorization: `Bearer ${ctx.accessToken}` };
+        const body = { contents, generationConfig: genConfig };
+        if (systemParts.length > 0) body.systemInstruction = { parts: systemParts };
+        const streamUrl = `${modelPath}:streamGenerateContent?alt=sse`;
+        let res;
+        try { res = await Risuai.nativeFetch(streamUrl, { method: "POST", headers, body: JSON.stringify(body) }); }
+        catch (e) { res = await fetch(streamUrl, { method: "POST", headers, body: JSON.stringify(body) }); }
+        if (!res.ok) {
+          const errText = await res.text().catch(() => "");
+          throw new Error(`status=${res.status}, body=${errText.slice(0, 500)}`);
+        }
+        if (!res.body) throw new Error("응답에 스트림 body가 없습니다 (res.body is null).");
+        const stream = createSSEStream(res, undefined);
+        const reader = stream.getReader();
+        const decoder = new TextDecoder();
+        let full = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          full += typeof value === "string" ? value : decoder.decode(value);
+        }
+        return `스트리밍 성공. 최종 텍스트: ${full.slice(0, 300)}`;
+      }, 30000);
+
+      await step("등록된 모델 목록 확인", async () => {
+        if (_registeredModels.length === 0) {
+          return "이 세션에서 addProvider로 등록된 모델이 없습니다. '모델 목록 새로고침 & 등록' 버튼을 먼저 눌러보세요.";
+        }
+        return _registeredModels.map(m => `- ${m.displayName} (id=${m.id})`).join("\n");
+      });
+
+      append(`\n=== 진단 완료 (${new Date().toISOString()}) ===`);
+    } catch (fatal) {
+      append(`\n!!! 진단 러너 자체에서 예상치 못한 오류 발생: ${fatal && (fatal.stack || fatal.message) || fatal} !!!`);
+    }
   }
 
   // ─── Settings UI ─────────────────────────────────────────────────────────────
@@ -902,6 +1135,31 @@
           <div class="vg-row">
             <label></label>
             <div><button class="vg-btn" id="vg-test-auth">🔍 인증 테스트</button><span class="vg-status" id="vg-auth-status"></span></div>
+          </div>
+        </div>
+
+        <div class="vg-section">
+          <h3>🐞 디버그 / 진단</h3>
+          <p style="font-size:11px;color:#888;margin:0 0 10px;">
+            아래 버튼을 누르면 인증, 토큰 발급, 네트워크, 모델 목록, 실제 채팅(스트리밍/비스트리밍)까지
+            전부 순서대로 테스트하고 결과를 아래 박스에 출력합니다. 한 단계가 실패하거나 멈춰도
+            (타임아웃 처리됨) 나머지 단계는 계속 진행됩니다. 결과를 복사해서 대화창에 붙여넣어 주세요.
+            (Service Account의 private_key나 전체 토큰 값은 출력하지 않습니다.)
+          </p>
+          <div class="vg-row">
+            <label>테스트할 모델 ID <span style="color:#666">(선택)</span></label>
+            <input id="vg-diag-model" type="text" placeholder="비워두면 gemini-2.5-flash 사용">
+          </div>
+          <div class="vg-row">
+            <label></label>
+            <div>
+              <button class="vg-btn" id="vg-run-diagnostics">🧪 종합 진단 실행</button>
+              <button class="vg-btn-secondary" id="vg-copy-diagnostics">📋 클립보드에 복사</button>
+            </div>
+          </div>
+          <div class="vg-row">
+            <label></label>
+            <textarea id="vg-diag-output" readonly style="min-height:300px; font-family:monospace; font-size:11px; white-space:pre-wrap;" placeholder="진단 실행 결과가 여기에 표시됩니다."></textarea>
           </div>
         </div>
 
@@ -1064,6 +1322,46 @@
       } catch (e) {
         status.className = "vg-status err";
         status.textContent = `✗ ${e.message}`;
+      }
+    });
+
+    root.querySelector("#vg-run-diagnostics").addEventListener("click", async () => {
+      const btn = root.querySelector("#vg-run-diagnostics");
+      const out = root.querySelector("#vg-diag-output");
+      const diagModelId = root.querySelector("#vg-diag-model").value.trim();
+      btn.disabled = true;
+      const originalLabel = btn.textContent;
+      btn.textContent = "⏳ 진행 중...";
+      try {
+        // Persist current form values first so diagnostics test what's
+        // actually on screen, not stale saved settings.
+        for (const key of fields) {
+          const el = root.querySelector(`#${key}`);
+          if (!el) continue;
+          try { await Risuai.setArgument(key, el.value || ""); } catch {}
+        }
+        out.value = "";
+        await runDiagnostics(root, diagModelId);
+      } catch (e) {
+        // runDiagnostics already catches everything internally, but this
+        // outer guard exists so a bug in the harness itself can never leave
+        // the button stuck disabled or throw into RisuAI's UI.
+        out.value += `\n\n!!! 예상치 못한 오류: ${e && (e.stack || e.message) || e} !!!`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalLabel;
+      }
+    });
+
+    root.querySelector("#vg-copy-diagnostics").addEventListener("click", async () => {
+      const out = root.querySelector("#vg-diag-output");
+      try {
+        await navigator.clipboard.writeText(out.value);
+      } catch {
+        // Clipboard permissions aren't guaranteed inside the plugin sandbox -
+        // fall back to selecting the text so the user can Ctrl+C manually.
+        out.focus();
+        out.select();
       }
     });
 
