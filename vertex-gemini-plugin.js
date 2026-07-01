@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.0.8
+//@version 1.0.9
 
 // ===== Settings Arguments =====
 
@@ -13,6 +13,7 @@
 // Model
 //@arg vg_custom_model string 추가 커스텀 모델 ID (목록에 없는 모델을 직접 등록하고 싶을 때만)
 //@arg vg_dynamic_models string 동적 모델 목록 JSON (자동 관리, 수정하지 마세요)
+//@arg vg_excluded_models string 등록에서 제외할 모델 ID 목록 (콤마 구분, 자동 관리)
 
 // Generation Config
 //@arg vg_temperature string Temperature (0.0~2.0, 기본값: 1.0)
@@ -970,10 +971,18 @@
     );
   }
 
+  async function getExcludedModelIds() {
+    const raw = await getArg("vg_excluded_models", "");
+    return new Set(raw.split(",").map(s => s.trim()).filter(Boolean));
+  }
+
   async function registerAllModels(models) {
     _registeredModels.length = 0;
+    const excluded = await getExcludedModelIds();
     let registered = 0;
+    let skipped = 0;
     for (const model of models) {
+      if (excluded.has(model.id)) { skipped++; continue; }
       try {
         await registerModel(model);
         registered++;
@@ -984,7 +993,7 @@
 
     // Register a manually-typed custom model too, if set and not already present
     const customId = (await getArg("vg_custom_model", "")).trim();
-    if (customId && !models.some(m => m.id === customId)) {
+    if (customId && !excluded.has(customId) && !models.some(m => m.id === customId)) {
       try {
         await registerModel({ id: customId, name: `Custom: ${customId}` });
         registered++;
@@ -993,7 +1002,7 @@
       }
     }
 
-    log(`✓ ${registered}개 모델을 RisuAI에 등록했습니다.`);
+    log(`✓ ${registered}개 모델을 RisuAI에 등록했습니다. (제외됨: ${skipped}개)`);
     return registered;
   }
 
@@ -1199,6 +1208,57 @@
     }
   }
 
+  // ─── Model Selection List UI ────────────────────────────────────────────────
+
+  // Renders checkboxes for `models` into #vg-model-list, checked/unchecked
+  // according to the current (unsaved-included) value of the hidden
+  // #vg_excluded_models field, and keeps that hidden field in sync as the
+  // user toggles boxes. Purely a DOM helper - actual persistence happens
+  // when the user clicks Save or the "체크 상태 반영" button.
+  function renderModelList(root, models) {
+    const listEl = root.querySelector("#vg-model-list");
+    const hidden = root.querySelector("#vg_excluded_models");
+    if (!listEl || !hidden) return;
+
+    if (!models || models.length === 0) {
+      listEl.innerHTML = `<span style="color:#666;">모델 목록을 아직 불러오지 않았습니다.</span>`;
+      return;
+    }
+
+    const excluded = new Set(String(hidden.value || "").split(",").map(s => s.trim()).filter(Boolean));
+
+    listEl.innerHTML = models.map((m, i) => `
+      <label style="display:flex; align-items:center; gap:6px; padding:3px 0; cursor:pointer;">
+        <input type="checkbox" class="vg-model-checkbox" data-model-id="${m.id}" ${excluded.has(m.id) ? "" : "checked"}>
+        <span>${m.name || m.id}${m.name && m.name !== m.id ? ` <span style="color:#666;">(${m.id})</span>` : ""}</span>
+      </label>
+    `).join("");
+
+    listEl.querySelectorAll(".vg-model-checkbox").forEach(cb => {
+      cb.addEventListener("change", () => {
+        const id = cb.getAttribute("data-model-id");
+        const current = new Set(String(hidden.value || "").split(",").map(s => s.trim()).filter(Boolean));
+        if (cb.checked) current.delete(id); else current.add(id);
+        hidden.value = Array.from(current).join(",");
+      });
+    });
+  }
+
+  function getModelListCheckboxIds(root) {
+    return Array.from(root.querySelectorAll(".vg-model-checkbox")).map(cb => cb.getAttribute("data-model-id"));
+  }
+
+  async function loadCachedOrFallbackModels() {
+    const cached = await getArg("vg_dynamic_models", "");
+    if (cached.trim()) {
+      try {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      } catch { /* fall through to fallback list */ }
+    }
+    return FALLBACK_MODELS;
+  }
+
   // ─── Settings UI ─────────────────────────────────────────────────────────────
 
   async function renderSettings() {
@@ -1207,6 +1267,7 @@
       "vg_token_bridge_url",
       "vg_location",
       "vg_custom_model",
+      "vg_excluded_models",
       "vg_temperature",
       "vg_max_tokens",
       "vg_top_p",
@@ -1355,6 +1416,26 @@
             <div><button class="vg-btn" id="vg-fetch-models">⬇ 모델 목록 새로고침 & 등록</button><span class="vg-status" id="vg-model-status"></span></div>
           </div>
           <p style="font-size:11px;color:#888;margin:4px 0 0;">저장 후 "모델 목록 새로고침 & 등록"을 누르면 RisuAI 모델 선택창에 모델들이 나타납니다. (또는 플러그인 재시작/재활성화)</p>
+
+          <input type="hidden" id="vg_excluded_models">
+          <div class="vg-row" style="margin-top:14px;">
+            <label>불러온 모델 목록</label>
+            <div style="flex:1;">
+              <p style="font-size:11px;color:#888;margin:0 0 8px;">
+                체크 해제한 모델은 다음 등록부터 RisuAI 모델 선택창에 나타나지 않습니다.
+                (다시 불러오지 않고 지금 목록 그대로 반영하려면 "체크 상태 반영" 사용)
+              </p>
+              <div id="vg-model-list" style="max-height:260px; overflow-y:auto; border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:8px; font-size:12px;">
+                <span style="color:#666;">모델 목록을 아직 불러오지 않았습니다.</span>
+              </div>
+              <div style="margin-top:8px;">
+                <button class="vg-btn-secondary" id="vg-select-all-models">전체 선택</button>
+                <button class="vg-btn-secondary" id="vg-select-none-models">전체 해제</button>
+                <button class="vg-btn" id="vg-apply-model-selection">✅ 체크 상태 반영 (다시 등록)</button>
+                <span class="vg-status" id="vg-model-selection-status"></span>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div class="vg-section">
@@ -1464,6 +1545,34 @@
       el.value = val;
     }
 
+    renderModelList(root, await loadCachedOrFallbackModels());
+
+    root.querySelector("#vg-select-all-models").addEventListener("click", () => {
+      root.querySelectorAll(".vg-model-checkbox").forEach(cb => { cb.checked = true; });
+      root.querySelector("#vg_excluded_models").value = "";
+    });
+
+    root.querySelector("#vg-select-none-models").addEventListener("click", () => {
+      root.querySelectorAll(".vg-model-checkbox").forEach(cb => { cb.checked = false; });
+      root.querySelector("#vg_excluded_models").value = getModelListCheckboxIds(root).join(",");
+    });
+
+    root.querySelector("#vg-apply-model-selection").addEventListener("click", async () => {
+      const status = root.querySelector("#vg-model-selection-status");
+      status.className = "vg-status";
+      status.textContent = "적용 중...";
+      try {
+        await Risuai.setArgument("vg_excluded_models", root.querySelector("#vg_excluded_models").value || "");
+        const models = await loadCachedOrFallbackModels();
+        const count = await registerAllModels(models);
+        status.className = "vg-status ok";
+        status.textContent = `✓ 체크 상태 반영 완료. ${count}개 모델 등록됨 (재조회 없이 캐시된 목록 사용). 모델 선택창을 확인하세요.`;
+      } catch (e) {
+        status.className = "vg-status err";
+        status.textContent = `✗ ${e.message}`;
+      }
+    });
+
     root.querySelector("#vg-close-btn").addEventListener("click", async () => {
       await Risuai.hideContainer();
     });
@@ -1567,10 +1676,11 @@
       try {
         const models = await fetchDynamicModels();
         const finalModels = (models && models.length > 0) ? models : FALLBACK_MODELS;
+        renderModelList(root, finalModels);
         const count = await registerAllModels(finalModels);
         status.className = "vg-status ok";
         status.textContent = models
-          ? `✓ Vertex에서 ${models.length}개 모델 로드, ${count}개 등록 완료. 모델 선택창을 확인하세요.`
+          ? `✓ Vertex에서 ${models.length}개 모델 로드, ${count}개 등록 완료. 아래 목록에서 제외하고 싶은 모델의 체크를 해제할 수 있습니다.`
           : `⚠ 동적 로드 실패, 기본 모델 ${count}개 등록함. SA JSON/권한을 확인하세요.`;
       } catch (e) {
         status.className = "vg-status err";
@@ -1603,6 +1713,7 @@
         if (el) el.value = "";
         try { await Risuai.setArgument(key, ""); } catch {}
       }
+      renderModelList(root, await loadCachedOrFallbackModels());
     });
 
     await Risuai.showContainer("fullscreen");
