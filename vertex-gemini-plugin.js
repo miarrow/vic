@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.0.7
+//@version 1.0.8
 
 // ===== Settings Arguments =====
 
@@ -374,6 +374,15 @@
       const geminiRole = role === "assistant" ? "model" : "user";
       const parts = convertContentToParts(msg.content);
       if (parts.length === 0) continue;
+
+      // Trailing system-role messages (an in-context note/instruction, not
+      // the persona preamble) get folded into a user turn - but mark them
+      // with a "system: " text prefix so the model can still tell it's a
+      // meta-instruction rather than something the human literally typed.
+      // Matches the reference plugin's exact convention for this case.
+      if (role === "system" && parts[0] && typeof parts[0].text === "string" && !parts[0].text.startsWith("system: ")) {
+        parts[0] = { ...parts[0], text: `system: ${parts[0].text}` };
+      }
 
       const last = contents[contents.length - 1];
       if (last && last.role === geminiRole) {
