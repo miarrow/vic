@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.0.6
+//@version 1.0.7
 
 // ===== Settings Arguments =====
 
@@ -653,8 +653,27 @@
         return await callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig);
       }
 
-      chatLog("createSSEStream 생성 후 {success:true, content:<ReadableStream>} 반환 시도 - 이 반환값이 iframe 경계를 넘어가야 RisuAI에 실제로 전달됩니다.");
-      return { success: true, content: createSSEStream(res, abortSignal, !!genConfig?.thinkingConfig?.includeThoughts) };
+      // A raw ReadableStream returned here has to cross the plugin's
+      // sandboxed iframe -> RisuAI postMessage boundary. In testing, the
+      // user confirmed non-streaming (plain string content) always
+      // delivers correctly, while this ReadableStream path silently
+      // produces nothing in the RisuAI chat UI despite our own logs
+      // showing pull()/enqueue/close all completing normally on this side
+      // of that boundary. Rather than keep guessing at the exact transfer
+      // failure, drain the stream fully here (still using the streaming
+      // endpoint) and return a plain string, matching the delivery method
+      // that's proven to actually work.
+      chatLog("스트림을 iframe 내부에서 끝까지 직접 읽어서 문자열로 반환합니다 (ReadableStream 직접 반환은 RisuAI에 전달되지 않는 것으로 확인됨).");
+      const stream = createSSEStream(res, abortSignal, !!genConfig?.thinkingConfig?.includeThoughts);
+      const reader = stream.getReader();
+      let fullText = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        fullText += value;
+      }
+      chatLog(`스트림 드레인 완료. 최종 텍스트 길이=${fullText.length}`);
+      return { success: true, content: fullText };
     } else {
       chatLog("비스트리밍 모드: callGeminiNonStream 호출");
       return await callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig);
