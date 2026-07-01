@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.0.3
+//@version 1.0.4
 
 // ===== Settings Arguments =====
 
@@ -123,6 +123,29 @@
   // Tracks every model this session actually handed to Risuai.addProvider,
   // so the diagnostics panel can show ground truth instead of guessing.
   const _registeredModels = [];
+
+  // Live log of REAL fetcher invocations coming from RisuAI's actual chat UI
+  // (as opposed to the synthetic diagnostics test, which never leaves this
+  // iframe's own JS realm). This is module-level state that survives across
+  // opening/closing the settings panel, because RisuAI keeps this plugin's
+  // sandboxed iframe alive for the whole session — only a full page reload
+  // clears it. Capped so a runaway loop can't grow it forever.
+  const _chatLog = [];
+  let _chatLogEpoch = 0;
+  // Muted while the synthetic diagnostics panel drives callGemini/
+  // callGeminiNonStream/createSSEStream directly, so those runs don't get
+  // interleaved with (and misread as) a real RisuAI-triggered chat call.
+  let _chatLogMuted = false;
+  function chatLog(...parts) {
+    if (_chatLogMuted) return;
+    const rel = _chatLogEpoch ? `+${Date.now() - _chatLogEpoch}ms` : "+0ms";
+    _chatLog.push(`[${rel}] ${parts.map(p => typeof p === "string" ? p : JSON.stringify(p)).join(" ")}`);
+    if (_chatLog.length > 2000) _chatLog.splice(0, _chatLog.length - 2000);
+  }
+  function chatLogNewCall(label) {
+    _chatLogEpoch = Date.now();
+    _chatLog.push(`\n=== ${label} (${new Date().toISOString()}) ===`);
+  }
 
   // Never print secrets raw - only enough to eyeball "is this the right one".
   function redact(s, keep = 6) {
@@ -461,13 +484,26 @@
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let pullCount = 0;
+    let enqueueCount = 0;
+
+    chatLog("createSSEStream: ReadableStream 생성됨 (아직 아무도 읽지 않음)");
 
     return new ReadableStream({
       async pull(controller) {
+        pullCount++;
+        if (pullCount === 1) chatLog("pull() 최초 호출됨 — RisuAI(또는 다른 소비자)가 스트림을 실제로 읽기 시작함");
         while (true) {
-          if (abortSignal?.aborted) { controller.close(); reader.cancel(); return; }
-          const { done, value } = await reader.read();
-          if (done) { controller.close(); return; }
+          if (abortSignal?.aborted) { chatLog("abortSignal aborted, 스트림 닫음"); controller.close(); reader.cancel(); return; }
+          let done, value;
+          try {
+            ({ done, value } = await reader.read());
+          } catch (e) {
+            chatLog("reader.read() 예외:", e && (e.stack || e.message) || e);
+            controller.error(e);
+            return;
+          }
+          if (done) { chatLog(`업스트림 완료(done). 총 pull() ${pullCount}회, enqueue ${enqueueCount}회`); controller.close(); return; }
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split("\n");
@@ -477,29 +513,35 @@
             const trimmed = line.trim();
             if (!trimmed || !trimmed.startsWith("data:")) continue;
             const jsonStr = trimmed.slice(5).trim();
-            if (jsonStr === "[DONE]") { controller.close(); return; }
+            if (jsonStr === "[DONE]") { chatLog("[DONE] 마커 수신, 스트림 닫음"); controller.close(); return; }
             try {
               const data = JSON.parse(jsonStr);
               const candidate = data.candidates?.[0];
               if (!candidate) continue;
               for (const part of candidate.content?.parts || []) {
-                if (part.text) controller.enqueue(part.text);
-                else if (part.inlineData) {
+                if (part.text) {
+                  enqueueCount++;
+                  if (enqueueCount <= 3 || enqueueCount % 20 === 0) chatLog(`enqueue #${enqueueCount}: "${part.text.slice(0, 60)}"`);
+                  controller.enqueue(part.text);
+                } else if (part.inlineData) {
                   const { mimeType, data: imgData } = part.inlineData;
+                  enqueueCount++;
+                  chatLog(`enqueue #${enqueueCount}: 이미지 (${mimeType}, base64 길이 ${imgData.length})`);
                   controller.enqueue(`![generated](data:${mimeType};base64,${imgData})`);
                 }
               }
-            } catch { /* skip malformed line */ }
+            } catch (e) { chatLog("SSE 라인 파싱 실패(무시하고 계속):", jsonStr.slice(0, 150)); }
           }
         }
       },
-      cancel() { reader.cancel(); }
+      cancel(reason) { chatLog("cancel() 호출됨 (소비자가 스트림을 취소함):", reason); reader.cancel(); }
     });
   }
 
   // ─── Gemini Fetcher ───────────────────────────────────────────────────────────
 
   async function callGemini(args, modelId, abortSignal) {
+    chatLog(`callGemini 시작 (model=${modelId}, abortSignal=${abortSignal ? "있음" : "없음"})`);
     const saJson      = await getArg("vg_service_account_json", "");
     const location    = (await getArg("vg_location", "us-central1")).trim() || "us-central1";
     const bridgeUrl   = (await getArg("vg_token_bridge_url", "")).trim();
@@ -508,18 +550,20 @@
     const grounding   = await getBoolArg("vg_grounding", false);
     const groundingDR = parseFloat2(await getArg("vg_grounding_dynamic_retrieval", ""), undefined);
     const serviceTier = (await getArg("vg_service_tier", "")).trim().toUpperCase();
+    chatLog(`설정 로드 완료: location=${location}, streaming=${streaming}, grounding=${grounding}`);
 
     if (!saJson.trim()) {
+      chatLog("SA JSON 비어있음 - 중단");
       return { success: false, content: `[${PLUGIN_NAME}] Service Account JSON이 설정되지 않았습니다. 플러그인 설정에서 입력해 주세요.` };
     }
 
     let sa;
-    try { sa = parseSA(saJson); }
-    catch (e) { return { success: false, content: `[${PLUGIN_NAME}] SA JSON 오류: ${e.message}` }; }
+    try { sa = parseSA(saJson); chatLog("SA JSON 파싱 성공:", sa.project_id); }
+    catch (e) { chatLog("SA JSON 파싱 실패:", e.message); return { success: false, content: `[${PLUGIN_NAME}] SA JSON 오류: ${e.message}` }; }
 
     let accessToken;
-    try { accessToken = await getAccessToken(saJson, bridgeUrl || undefined); }
-    catch (e) { return { success: false, content: `[${PLUGIN_NAME}] 인증 오류: ${e.message}` }; }
+    try { accessToken = await getAccessToken(saJson, bridgeUrl || undefined); chatLog("토큰 획득 성공:", redact(accessToken, 6)); }
+    catch (e) { chatLog("토큰 획득 실패:", e.message); return { success: false, content: `[${PLUGIN_NAME}] 인증 오류: ${e.message}` }; }
 
     const baseUrl = location === "global"
       ? "https://aiplatform.googleapis.com"
@@ -527,11 +571,13 @@
     const modelPath = `${baseUrl}/v1/projects/${sa.project_id}/locations/${location}/publishers/google/models/${modelId}`;
 
     const messages = args?.prompt_chat || [];
+    chatLog(`args.prompt_chat 메시지 수: ${messages.length}, args 키 목록: ${Object.keys(args || {}).join(", ")}`);
     const { contents, systemParts } = convertMessagesToGemini(messages, preserveSys);
+    chatLog(`Gemini 형식 변환 완료: contents ${contents.length}개, systemParts ${systemParts.length}개`);
 
     let genConfig;
     try { genConfig = await buildGenerationConfig(args); }
-    catch (e) { return { success: false, content: `[${PLUGIN_NAME}] 파라미터 오류: ${e.message}` }; }
+    catch (e) { chatLog("생성 파라미터 오류:", e.message); return { success: false, content: `[${PLUGIN_NAME}] 파라미터 오류: ${e.message}` }; }
 
     const safetySettings = await buildSafetySettings();
 
@@ -556,13 +602,18 @@
 
     if (streaming) {
       const streamUrl = `${modelPath}:streamGenerateContent?alt=sse`;
+      chatLog("스트리밍 모드: nativeFetch 호출 시작 ->", streamUrl);
       let res;
       try {
         res = await Risuai.nativeFetch(streamUrl, { method: "POST", headers, body: bodyStr, signal: abortSignal });
-      } catch {
+        chatLog("nativeFetch 응답 도착. status=", res.status);
+      } catch (e1) {
+        chatLog("nativeFetch 실패, fetch()로 폴백 시도:", e1 && (e1.message || e1));
         try {
           res = await fetch(streamUrl, { method: "POST", headers, body: bodyStr, signal: abortSignal });
+          chatLog("fetch() 폴백 응답 도착. status=", res.status);
         } catch (e2) {
+          chatLog("fetch() 폴백도 실패:", e2.message);
           return { success: false, content: `[${PLUGIN_NAME}] 네트워크 오류: ${e2.message}` };
         }
       }
@@ -570,39 +621,52 @@
       if (!res.ok) {
         if (res.status === 401 || res.status === 403) delete _tokenCache[sa.client_email];
         const errText = await res.text().catch(() => "");
+        chatLog(`API 오류 응답 (status=${res.status}):`, errText.slice(0, 500));
         return { success: false, content: `[${PLUGIN_NAME}] API 오류 ${res.status}: ${errText.substring(0, 300)}` };
       }
 
       if (!res.body) {
+        chatLog("res.body가 없음 (스트림 미지원 응답) - 비스트리밍으로 폴백");
         return await callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig);
       }
 
+      chatLog("createSSEStream 생성 후 {success:true, content:<ReadableStream>} 반환 시도 - 이 반환값이 iframe 경계를 넘어가야 RisuAI에 실제로 전달됩니다.");
       return { success: true, content: createSSEStream(res, abortSignal) };
     } else {
+      chatLog("비스트리밍 모드: callGeminiNonStream 호출");
       return await callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig);
     }
   }
 
   async function callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig) {
     const url = `${modelPath}:generateContent`;
+    chatLog("callGeminiNonStream: nativeFetch 호출 시작 ->", url);
     let res;
     try {
       res = await Risuai.nativeFetch(url, { method: "POST", headers, body: bodyStr, signal: abortSignal });
-    } catch {
+      chatLog("nativeFetch 응답 도착. status=", res.status);
+    } catch (e1) {
+      chatLog("nativeFetch 실패, fetch()로 폴백 시도:", e1 && (e1.message || e1));
       try {
         res = await fetch(url, { method: "POST", headers, body: bodyStr, signal: abortSignal });
+        chatLog("fetch() 폴백 응답 도착. status=", res.status);
       } catch (e2) {
+        chatLog("fetch() 폴백도 실패:", e2.message);
         return { success: false, content: `[${PLUGIN_NAME}] 네트워크 오류: ${e2.message}` };
       }
     }
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
+      chatLog(`API 오류 응답 (status=${res.status}):`, errText.slice(0, 500));
       return { success: false, content: `[${PLUGIN_NAME}] API 오류 ${res.status}: ${errText.substring(0, 300)}` };
     }
 
     const data = await res.json();
-    return parseGeminiResponse(data, genConfig);
+    chatLog("응답 JSON 파싱 완료, parseGeminiResponse 호출");
+    const parsed = parseGeminiResponse(data, genConfig);
+    chatLog("최종 반환:", JSON.stringify(parsed).slice(0, 300));
+    return parsed;
   }
 
   // ─── Imagen Fetcher ───────────────────────────────────────────────────────────
@@ -640,6 +704,7 @@
       parameters: { sampleCount: Math.min(Math.max(count, 1), 4), aspectRatio: aspect },
     };
 
+    chatLog("callImagen: nativeFetch 호출 시작 ->", url);
     let res;
     try {
       res = await Risuai.nativeFetch(url, {
@@ -647,12 +712,15 @@
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
         body: JSON.stringify(body),
       });
+      chatLog("nativeFetch 응답 도착. status=", res.status);
     } catch (e) {
+      chatLog("callImagen nativeFetch 실패:", e.message);
       return { success: false, content: `[${PLUGIN_NAME}] 네트워크 오류: ${e.message}` };
     }
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
+      chatLog(`Imagen API 오류 응답 (status=${res.status}):`, errText.slice(0, 500));
       return { success: false, content: `[${PLUGIN_NAME}] Imagen 오류 ${res.status}: ${errText.substring(0, 300)}` };
     }
 
@@ -818,17 +886,32 @@
     await Risuai.addProvider(
       displayName,
       async (args, abortSignal) => {
+        // This is the ACTUAL entry point RisuAI's real chat UI calls - as
+        // opposed to the synthetic diagnostics test, which never leaves this
+        // iframe's own JS realm. Every real chat attempt starts a fresh log
+        // section here so "마지막 실제 채팅 로그 보기" always reflects the
+        // most recent genuine invocation from RisuAI itself.
+        chatLogNewCall(`실제 채팅 호출 수신 (모델: ${model.id})`);
         try {
+          chatLog("addProvider 콜백 진입. args 타입:", typeof args, "/ mode:", args?.mode, "/ prompt_chat 길이:", args?.prompt_chat?.length);
+          let result;
           if (isImagenId(model.id)) {
-            return await callImagen(args, model.id);
+            chatLog("Imagen 모델로 판단, callImagen 호출");
+            result = await callImagen(args, model.id);
+          } else {
+            const imageMode = await getArg("vg_image_mode", "none");
+            if (imageMode === "imagen") {
+              chatLog("vg_image_mode=imagen 설정에 따라 callImagen 호출");
+              result = await callImagen(args, model.id);
+            } else {
+              result = await callGemini(args, model.id, abortSignal);
+            }
           }
-          const imageMode = await getArg("vg_image_mode", "none");
-          if (imageMode === "imagen") {
-            return await callImagen(args, model.id);
-          }
-          return await callGemini(args, model.id, abortSignal);
+          chatLog(`addProvider 콜백이 값을 반환하려는 중: success=${result?.success}, content 타입=${typeof result?.content}${result?.content && typeof result.content.getReader === "function" ? " (ReadableStream)" : ""}`);
+          return result;
         } catch (e) {
           err("Fetcher crash:", e);
+          chatLog("addProvider 콜백에서 예외 발생(치명적):", e && (e.stack || e.message) || e);
           return { success: false, content: `[${PLUGIN_NAME}] 오류: ${e.message}` };
         }
       },
@@ -896,6 +979,7 @@
       return r;
     }
 
+    _chatLogMuted = true;
     try {
       append(`=== 🔷 Vertex Gemini 종합 진단 시작 (${new Date().toISOString()}) ===`);
 
@@ -1059,6 +1143,8 @@
       append(`\n=== 진단 완료 (${new Date().toISOString()}) ===`);
     } catch (fatal) {
       append(`\n!!! 진단 러너 자체에서 예상치 못한 오류 발생: ${fatal && (fatal.stack || fatal.message) || fatal} !!!`);
+    } finally {
+      _chatLogMuted = false;
     }
   }
 
@@ -1160,6 +1246,28 @@
           <div class="vg-row">
             <label></label>
             <textarea id="vg-diag-output" readonly style="min-height:300px; font-family:monospace; font-size:11px; white-space:pre-wrap;" placeholder="진단 실행 결과가 여기에 표시됩니다."></textarea>
+          </div>
+          <p style="font-size:11px;color:#f0b429;margin:16px 0 6px;">
+            ⚠ 위 진단은 이 설정 화면 안에서만 실행되기 때문에, RisuAI 채팅창에서 실제로 메시지를
+            보낼 때 통과하는 경로(플러그인 iframe → RisuAI 본체로 응답 전달)는 검증하지 못합니다.
+            "채팅이 무한 대기한다" 같은 문제는 아래 버튼으로 확인하세요.
+          </p>
+          <div class="vg-row">
+            <label></label>
+            <div>
+              <button class="vg-btn" id="vg-view-chatlog">📜 마지막 실제 채팅 로그 보기</button>
+              <button class="vg-btn-secondary" id="vg-copy-chatlog">📋 클립보드에 복사</button>
+              <button class="vg-btn-secondary" id="vg-clear-chatlog">🗑 로그 지우기</button>
+            </div>
+          </div>
+          <p style="font-size:11px;color:#888;margin:4px 0 10px;">
+            사용법: 이 설정창을 닫지 않아도 됩니다(닫아도 무방). RisuAI 채팅창으로 가서 이 모델로
+            실제 메시지를 하나 보내보세요 (응답이 오든 안 오든, 무한 대기 상태여도 상관없습니다).
+            그 다음 이 설정창을 다시 열고 아래 버튼을 눌러 방금 그 호출의 실제 진행 상황을 확인하세요.
+          </p>
+          <div class="vg-row">
+            <label></label>
+            <textarea id="vg-chatlog-output" readonly style="min-height:300px; font-family:monospace; font-size:11px; white-space:pre-wrap;" placeholder="아직 기록된 실제 채팅 호출이 없습니다. 채팅을 먼저 보내보세요."></textarea>
           </div>
         </div>
 
@@ -1360,6 +1468,34 @@
       } catch {
         // Clipboard permissions aren't guaranteed inside the plugin sandbox -
         // fall back to selecting the text so the user can Ctrl+C manually.
+        out.focus();
+        out.select();
+      }
+    });
+
+    root.querySelector("#vg-view-chatlog").addEventListener("click", () => {
+      const out = root.querySelector("#vg-chatlog-output");
+      try {
+        out.value = _chatLog.length > 0
+          ? _chatLog.join("\n")
+          : "아직 기록된 실제 채팅 호출이 없습니다. RisuAI 채팅창에서 이 모델로 메시지를 하나 보낸 뒤 다시 눌러주세요.";
+        out.scrollTop = out.scrollHeight;
+      } catch (e) {
+        out.value = `로그를 불러오는 중 오류: ${e && (e.stack || e.message) || e}`;
+      }
+    });
+
+    root.querySelector("#vg-clear-chatlog").addEventListener("click", () => {
+      _chatLog.length = 0;
+      const out = root.querySelector("#vg-chatlog-output");
+      out.value = "";
+    });
+
+    root.querySelector("#vg-copy-chatlog").addEventListener("click", async () => {
+      const out = root.querySelector("#vg-chatlog-output");
+      try {
+        await navigator.clipboard.writeText(out.value);
+      } catch {
         out.focus();
         out.select();
       }
