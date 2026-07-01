@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.0.5
+//@version 1.0.6
 
 // ===== Settings Arguments =====
 
@@ -347,12 +347,22 @@
   function convertMessagesToGemini(messages, preserveSystem) {
     const contents = [];
     let systemParts = [];
+    // Only LEADING system messages (persona/description/scenario/jailbreak,
+    // before any real dialogue turn) are treated as global systemInstruction.
+    // A "system"-role message that appears AFTER the conversation has
+    // started is usually an in-context instruction for that specific turn
+    // (e.g. an author's note or "[System: ...]" reminder RisuAI's prompt
+    // template injects right before generation) - folding it into the
+    // global system block instead of keeping it as part of the actual turn
+    // can leave the real ask out of `contents` entirely, so Gemini has
+    // nothing concrete to respond to.
+    let sawDialogueTurn = false;
 
     for (const msg of messages) {
       if (!msg || !msg.role) continue;
       const role = msg.role;
 
-      if (role === "system") {
+      if (role === "system" && !sawDialogueTurn) {
         if (preserveSystem) {
           const text = typeof msg.content === "string" ? msg.content : extractText(msg.content);
           if (text.trim()) systemParts.push({ text: text.trim() });
@@ -360,6 +370,7 @@
         continue;
       }
 
+      sawDialogueTurn = true;
       const geminiRole = role === "assistant" ? "model" : "user";
       const parts = convertContentToParts(msg.content);
       if (parts.length === 0) continue;
@@ -577,8 +588,15 @@
 
     const messages = args?.prompt_chat || [];
     chatLog(`args.prompt_chat 메시지 수: ${messages.length}, args 키 목록: ${Object.keys(args || {}).join(", ")}`);
+    chatLog("원본 prompt_chat 역할 순서:", messages.map(m => m?.role || "?").join(" -> "));
     const { contents, systemParts } = convertMessagesToGemini(messages, preserveSys);
     chatLog(`Gemini 형식 변환 완료: contents ${contents.length}개, systemParts ${systemParts.length}개`);
+    chatLog("변환된 contents 역할 순서:", contents.map(c => c.role).join(" -> "));
+    contents.forEach((c, i) => {
+      const preview = (c.parts || []).map(p => p.text ? p.text.slice(0, 80) : "(비텍스트 part)").join(" | ");
+      chatLog(`  contents[${i}] role=${c.role}: "${preview}"`);
+    });
+    chatLog(`  systemInstruction 미리보기 (앞 200자): "${systemParts.map(p => p.text).join(" ").slice(0, 200)}"`);
 
     let genConfig;
     try { genConfig = await buildGenerationConfig(args); }
