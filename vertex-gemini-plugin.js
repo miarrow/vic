@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.0.4
+//@version 1.0.5
 
 // ===== Settings Arguments =====
 
@@ -480,7 +480,7 @@
     }
   }
 
-  function createSSEStream(response, abortSignal) {
+  function createSSEStream(response, abortSignal, includeThoughts = false) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -519,10 +519,15 @@
               const candidate = data.candidates?.[0];
               if (!candidate) continue;
               for (const part of candidate.content?.parts || []) {
+                if (part.thought && !includeThoughts) {
+                  chatLog(`사고 과정(thought) 파트 건너뜀 (includeThoughts=false): "${(part.text || "").slice(0, 60)}"`);
+                  continue;
+                }
                 if (part.text) {
                   enqueueCount++;
-                  if (enqueueCount <= 3 || enqueueCount % 20 === 0) chatLog(`enqueue #${enqueueCount}: "${part.text.slice(0, 60)}"`);
-                  controller.enqueue(part.text);
+                  const text = part.thought ? `<thinking>\n${part.text}\n</thinking>\n` : part.text;
+                  if (enqueueCount <= 3 || enqueueCount % 20 === 0) chatLog(`enqueue #${enqueueCount}${part.thought ? " [thought]" : ""}: "${text.slice(0, 60)}"`);
+                  controller.enqueue(text);
                 } else if (part.inlineData) {
                   const { mimeType, data: imgData } = part.inlineData;
                   enqueueCount++;
@@ -631,7 +636,7 @@
       }
 
       chatLog("createSSEStream 생성 후 {success:true, content:<ReadableStream>} 반환 시도 - 이 반환값이 iframe 경계를 넘어가야 RisuAI에 실제로 전달됩니다.");
-      return { success: true, content: createSSEStream(res, abortSignal) };
+      return { success: true, content: createSSEStream(res, abortSignal, !!genConfig?.thinkingConfig?.includeThoughts) };
     } else {
       chatLog("비스트리밍 모드: callGeminiNonStream 호출");
       return await callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig);
@@ -1121,7 +1126,7 @@
           throw new Error(`status=${res.status}, body=${errText.slice(0, 500)}`);
         }
         if (!res.body) throw new Error("응답에 스트림 body가 없습니다 (res.body is null).");
-        const stream = createSSEStream(res, undefined);
+        const stream = createSSEStream(res, undefined, !!genConfig?.thinkingConfig?.includeThoughts);
         const reader = stream.getReader();
         const decoder = new TextDecoder();
         let full = "";
