@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.0.1
+//@version 1.0.2
 
 // ===== Settings Arguments =====
 
@@ -654,24 +654,30 @@
     try {
       if (isImagenId(id)) {
         const url = `${baseUrl}/v1/projects/${project}/locations/${location}/publishers/google/models/${id}:predict`;
-        const res = await fetch(url, {
+        const opts = {
           method: "POST",
           headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
           body: JSON.stringify({ instances: [] }),
-        });
+        };
+        let res;
+        try { res = await Risuai.nativeFetch(url, opts); }
+        catch { res = await fetch(url, opts); }
         // 404/403 = model not found or no access. Any other status (e.g. 400
         // invalid argument for the empty instances) means the model exists.
         return res.status !== 404 && res.status !== 403;
       }
       const url = `${baseUrl}/v1/projects/${project}/locations/${location}/publishers/google/models/${id}:generateContent`;
-      const res = await fetch(url, {
+      const opts = {
         method: "POST",
         headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: "hi" }] }],
           generationConfig: { maxOutputTokens: 1 },
         }),
-      });
+      };
+      let res;
+      try { res = await Risuai.nativeFetch(url, opts); }
+      catch { res = await fetch(url, opts); }
       return res.ok;
     } catch {
       return false;
