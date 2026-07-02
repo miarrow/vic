@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.1.2
+//@version 1.2.0
 
 // ===== Settings Arguments =====
 
@@ -14,6 +14,7 @@
 //@arg vg_custom_model string 추가 커스텀 모델 ID (목록에 없는 모델을 직접 등록하고 싶을 때만)
 //@arg vg_dynamic_models string 동적 모델 목록 JSON (자동 관리, 수정하지 마세요)
 //@arg vg_excluded_models string 등록에서 제외할 모델 ID 목록 (콤마 구분, 자동 관리)
+//@arg vg_token_stats string 누적 토큰 사용량 통계 JSON (자동 관리, 수정하지 마세요)
 
 // Generation Config
 //@arg vg_temperature string Temperature (0.0~2.0, 기본값: 1.0)
@@ -496,6 +497,61 @@
     return genConfig;
   }
 
+  // ─── Token Usage Tracking ───────────────────────────────────────────────────────
+
+  const TOKEN_STATS_ARG = "vg_token_stats";
+  const EMPTY_TOKEN_TOTALS = { input: 0, output: 0, reasoning: 0, cached: 0, total: 0 };
+
+  // Gemini reports usage as promptTokenCount/candidatesTokenCount/etc. -
+  // normalize to a flat shape shared by both the running totals and the
+  // per-model breakdown so the accumulation code doesn't need to know
+  // about Gemini's specific field names.
+  function normalizeGeminiUsage(u) {
+    if (!u || typeof u !== "object") return null;
+    const input = u.promptTokenCount || 0;
+    const output = u.candidatesTokenCount || 0;
+    const reasoning = u.thoughtsTokenCount || 0;
+    const cached = u.cachedContentTokenCount || 0;
+    const total = u.totalTokenCount || (input + output + reasoning);
+    return { input, output, reasoning, cached, total };
+  }
+
+  async function loadTokenStats() {
+    try {
+      const raw = await getArg(TOKEN_STATS_ARG, "");
+      if (!raw.trim()) return { totals: { ...EMPTY_TOKEN_TOTALS }, requests: 0, perModel: {} };
+      const parsed = JSON.parse(raw);
+      parsed.totals = { ...EMPTY_TOKEN_TOTALS, ...(parsed.totals || {}) };
+      parsed.perModel = parsed.perModel || {};
+      parsed.requests = parsed.requests || 0;
+      return parsed;
+    } catch {
+      return { totals: { ...EMPTY_TOKEN_TOTALS }, requests: 0, perModel: {} };
+    }
+  }
+
+  async function saveTokenStats(stats) {
+    try { await Risuai.setArgument(TOKEN_STATS_ARG, JSON.stringify(stats)); }
+    catch (e) { warn("토큰 통계 저장 실패:", e.message); }
+  }
+
+  async function recordTokenUsage(modelId, usage) {
+    if (!usage) return;
+    const stats = await loadTokenStats();
+    for (const k of Object.keys(EMPTY_TOKEN_TOTALS)) stats.totals[k] = (stats.totals[k] || 0) + (usage[k] || 0);
+    stats.requests += 1;
+    if (!stats.perModel[modelId]) stats.perModel[modelId] = { ...EMPTY_TOKEN_TOTALS, requests: 0 };
+    const m = stats.perModel[modelId];
+    for (const k of Object.keys(EMPTY_TOKEN_TOTALS)) m[k] = (m[k] || 0) + (usage[k] || 0);
+    m.requests += 1;
+    await saveTokenStats(stats);
+    chatLog(`토큰 사용량 기록: model=${modelId}, 이번 요청 input=${usage.input}/output=${usage.output}/total=${usage.total} (누적 total=${stats.totals.total}, 누적 요청수=${stats.requests})`);
+  }
+
+  async function resetTokenStats() {
+    await saveTokenStats({ totals: { ...EMPTY_TOKEN_TOTALS }, requests: 0, perModel: {} });
+  }
+
   // ─── Response Parsing ─────────────────────────────────────────────────────────
 
   function partsToText(parts, includeThoughts) {
@@ -524,13 +580,13 @@
       }
       const includeThoughts = genConfig?.thinkingConfig?.includeThoughts;
       const text = partsToText(candidate.content?.parts, includeThoughts);
-      return { success: true, content: text };
+      return { success: true, content: text, usage: normalizeGeminiUsage(data.usageMetadata) };
     } catch (e) {
       return { success: false, content: `[${PLUGIN_NAME}] 응답 파싱 오류: ${e.message}` };
     }
   }
 
-  function createSSEStream(response, abortSignal, includeThoughts = false) {
+  function createSSEStream(response, abortSignal, includeThoughts = false, onUsage) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -566,6 +622,7 @@
             if (jsonStr === "[DONE]") { chatLog("[DONE] 마커 수신, 스트림 닫음"); controller.close(); return; }
             try {
               const data = JSON.parse(jsonStr);
+              if (data.usageMetadata && onUsage) onUsage(normalizeGeminiUsage(data.usageMetadata));
               const candidate = data.candidates?.[0];
               if (!candidate) continue;
               for (const part of candidate.content?.parts || []) {
@@ -691,7 +748,7 @@
 
       if (!res.body) {
         chatLog("res.body가 없음 (스트림 미지원 응답) - 비스트리밍으로 폴백");
-        return await callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig);
+        return await callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig, modelId);
       }
 
       // A raw ReadableStream returned here has to cross the plugin's
@@ -705,7 +762,8 @@
       // endpoint) and return a plain string, matching the delivery method
       // that's proven to actually work.
       chatLog("스트림을 iframe 내부에서 끝까지 직접 읽어서 문자열로 반환합니다 (ReadableStream 직접 반환은 RisuAI에 전달되지 않는 것으로 확인됨).");
-      const stream = createSSEStream(res, abortSignal, !!genConfig?.thinkingConfig?.includeThoughts);
+      let streamUsage = null;
+      const stream = createSSEStream(res, abortSignal, !!genConfig?.thinkingConfig?.includeThoughts, u => { streamUsage = u; });
       const reader = stream.getReader();
       let fullText = "";
       while (true) {
@@ -714,14 +772,15 @@
         fullText += value;
       }
       chatLog(`스트림 드레인 완료. 최종 텍스트 길이=${fullText.length}`);
+      if (streamUsage) await recordTokenUsage(modelId, streamUsage);
       return { success: true, content: fullText };
     } else {
       chatLog("비스트리밍 모드: callGeminiNonStream 호출");
-      return await callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig);
+      return await callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig, modelId);
     }
   }
 
-  async function callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig) {
+  async function callGeminiNonStream(modelPath, headers, bodyStr, abortSignal, genConfig, modelId) {
     const url = `${modelPath}:generateContent`;
     chatLog("callGeminiNonStream: nativeFetch 호출 시작 ->", url);
     let res;
@@ -748,6 +807,7 @@
     const data = await res.json();
     chatLog("응답 JSON 파싱 완료, parseGeminiResponse 호출");
     const parsed = parseGeminiResponse(data, genConfig);
+    if (parsed.success && parsed.usage && modelId) await recordTokenUsage(modelId, parsed.usage);
     chatLog("최종 반환:", JSON.stringify(parsed).slice(0, 300));
     return parsed;
   }
@@ -1653,6 +1713,26 @@
           </div>
         </div>
 
+        <div class="vg-section">
+          <h3>📊 토큰 사용량 (추정)</h3>
+          <p style="font-size:11px;color:#888;margin:0 0 10px;">
+            Gemini API 응답에 포함된 usageMetadata를 매 요청마다 누적 집계한 값입니다 (Google 결제 대시보드의
+            정확한 청구 값과는 약간 차이가 날 수 있습니다). 스트리밍/비스트리밍 실제 채팅 호출에서만 집계되며,
+            위 진단 패널의 테스트 호출은 집계에서 제외됩니다.
+          </p>
+          <div class="vg-row">
+            <label></label>
+            <div>
+              <button class="vg-btn" id="vg-refresh-token-stats">🔄 새로고침</button>
+              <button class="vg-btn-secondary" id="vg-reset-token-stats">🗑 통계 초기화</button>
+            </div>
+          </div>
+          <div class="vg-row">
+            <label></label>
+            <div id="vg-token-stats-output" style="flex:1; font-size:12px; line-height:1.6;">불러오는 중...</div>
+          </div>
+        </div>
+
         <div style="margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; padding-bottom: 40px;">
           <button class="vg-btn" id="vg-save-btn">💾 저장</button>
           <button class="vg-btn-secondary" id="vg-reset-btn">↩ 초기화</button>
@@ -1808,6 +1888,60 @@
     }
 
     root.querySelector("#vg-scan-images").addEventListener("click", refreshImageList);
+
+    async function renderTokenStatsPanel() {
+      const out = root.querySelector("#vg-token-stats-output");
+      const stats = await loadTokenStats();
+      const t = stats.totals;
+      const modelRows = Object.entries(stats.perModel)
+        .sort((a, b) => (b[1].total || 0) - (a[1].total || 0))
+        .map(([id, m]) => `
+          <tr>
+            <td style="padding:4px 8px; border-bottom:1px solid rgba(255,255,255,0.08);">${id}</td>
+            <td style="padding:4px 8px; border-bottom:1px solid rgba(255,255,255,0.08); text-align:right;">${m.requests}</td>
+            <td style="padding:4px 8px; border-bottom:1px solid rgba(255,255,255,0.08); text-align:right;">${m.input.toLocaleString()}</td>
+            <td style="padding:4px 8px; border-bottom:1px solid rgba(255,255,255,0.08); text-align:right;">${m.output.toLocaleString()}</td>
+            <td style="padding:4px 8px; border-bottom:1px solid rgba(255,255,255,0.08); text-align:right;">${m.reasoning.toLocaleString()}</td>
+            <td style="padding:4px 8px; border-bottom:1px solid rgba(255,255,255,0.08); text-align:right;">${m.total.toLocaleString()}</td>
+          </tr>
+        `).join("");
+
+      out.innerHTML = `
+        <div style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:12px;">
+          <div><b>${stats.requests.toLocaleString()}</b><br><span style="color:#888; font-size:11px;">누적 요청 수</span></div>
+          <div><b>${t.input.toLocaleString()}</b><br><span style="color:#888; font-size:11px;">Input 토큰</span></div>
+          <div><b>${t.output.toLocaleString()}</b><br><span style="color:#888; font-size:11px;">Output 토큰</span></div>
+          <div><b>${t.reasoning.toLocaleString()}</b><br><span style="color:#888; font-size:11px;">Thinking 토큰</span></div>
+          <div><b>${t.cached.toLocaleString()}</b><br><span style="color:#888; font-size:11px;">Cached 토큰</span></div>
+          <div><b>${t.total.toLocaleString()}</b><br><span style="color:#7eb8f7; font-size:11px;">전체 합계</span></div>
+        </div>
+        ${modelRows ? `
+          <table style="width:100%; border-collapse:collapse; font-size:11px;">
+            <thead>
+              <tr style="color:#888; text-align:left;">
+                <th style="padding:4px 8px;">모델</th>
+                <th style="padding:4px 8px; text-align:right;">요청수</th>
+                <th style="padding:4px 8px; text-align:right;">Input</th>
+                <th style="padding:4px 8px; text-align:right;">Output</th>
+                <th style="padding:4px 8px; text-align:right;">Thinking</th>
+                <th style="padding:4px 8px; text-align:right;">합계</th>
+              </tr>
+            </thead>
+            <tbody>${modelRows}</tbody>
+          </table>
+        ` : `<span style="color:#666;">아직 기록된 요청이 없습니다. 실제 채팅을 한 번 보내면 여기에 집계됩니다.</span>`}
+      `;
+    }
+
+    renderTokenStatsPanel();
+
+    root.querySelector("#vg-refresh-token-stats").addEventListener("click", renderTokenStatsPanel);
+
+    root.querySelector("#vg-reset-token-stats").addEventListener("click", async () => {
+      if (!confirm("누적된 토큰 사용량 통계를 전부 초기화할까요?")) return;
+      await resetTokenStats();
+      await renderTokenStatsPanel();
+    });
 
     root.querySelector("#vg-view-chatlog").addEventListener("click", () => {
       const out = root.querySelector("#vg-chatlog-output");
