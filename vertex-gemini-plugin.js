@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.3.0
+//@version 1.3.1
 
 // ===== Settings Arguments =====
 
@@ -547,7 +547,7 @@
     m.requests += 1;
     await saveTokenStats(stats);
     chatLog(`토큰 사용량 기록: model=${modelId}, 이번 요청 input=${usage.input}/output=${usage.output}/total=${usage.total} (누적 total=${stats.totals.total}, 누적 요청수=${stats.requests})`);
-    showTokenHud(modelId, usage, stats.totals.total);
+    await showTokenHud(modelId, usage, stats.totals.total);
   }
 
   async function resetTokenStats() {
@@ -564,18 +564,39 @@
   const TOKEN_HUD_ATTR = "data-vg-token-hud";
   let _tokenHudEpoch = 0;
 
+  // getRootDocument() triggers RisuAI's own "이 플러그인이 메인 화면 접근을
+  // 허용할까요?" confirm dialog on first use (permission id 'mainDom'). If
+  // the user never noticed/answered that dialog, or already dismissed it
+  // once, RisuAI just returns null (or the awaited confirm() call can sit
+  // pending) with no visible error - which looks identical to "the HUD
+  // code is silently broken". Every step here is logged to chatLog (visible
+  // via the existing "마지막 실제 채팅 로그" viewer) and wrapped with a
+  // timeout so a stuck permission-dialog promise can't hang forever.
+  function withTimeout(promise, ms, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} 타임아웃 (${ms}ms) - 권한 확인 대화상자가 응답하지 않았을 수 있습니다.`)), ms)),
+    ]);
+  }
+
   async function showTokenHud(modelId, usage, cumulativeTotal) {
     try {
       const enabled = await getBoolArg("vg_show_token_hud", true);
-      if (!enabled) return;
-      const doc = await Risuai.getRootDocument();
-      if (!doc) return;
+      if (!enabled) { chatLog("토큰 HUD: vg_show_token_hud=false, 건너뜀"); return; }
+
+      chatLog("토큰 HUD: Risuai.getRootDocument() 호출 (권한 대화상자가 뜰 수 있습니다)");
+      const doc = await withTimeout(Risuai.getRootDocument(), 15000, "getRootDocument()");
+      if (!doc) {
+        chatLog("토큰 HUD: getRootDocument()가 null 반환 - 'mainDom' 권한이 거부되었거나 아직 승인되지 않았습니다. 설정 패널의 '🔔 HUD 표시 테스트' 버튼으로 권한 대화상자를 다시 띄워보세요.");
+        return;
+      }
+      chatLog("토큰 HUD: root document 확보 성공");
 
       const existing = await doc.querySelector(`[${TOKEN_HUD_ATTR}]`);
-      if (existing) await existing.remove();
+      if (existing) { await existing.remove(); chatLog("토큰 HUD: 기존 뱃지 제거"); }
 
       const body = await doc.querySelector("body");
-      if (!body) return;
+      if (!body) { chatLog("토큰 HUD: body 엘리먼트를 찾지 못함"); return; }
 
       const el = await doc.createElement("div");
       await el.setAttribute(TOKEN_HUD_ATTR, "1");
@@ -603,6 +624,7 @@
         `<br><span style="color:#888;">누적 ${cumulativeTotal.toLocaleString()} 토큰</span>`
       );
       await body.appendChild(el);
+      chatLog("토큰 HUD: 뱃지 DOM에 추가 완료");
 
       const myEpoch = ++_tokenHudEpoch;
       setTimeout(() => {
@@ -616,7 +638,9 @@
         setTimeout(() => { if (myEpoch === _tokenHudEpoch) el.remove().catch(() => {}); }, 300);
       }, 7000);
     } catch (e) {
-      warn("토큰 HUD 표시 실패 (무시하고 계속):", e.message);
+      const msg = e && (e.stack || e.message) || String(e);
+      warn("토큰 HUD 표시 실패 (무시하고 계속):", msg);
+      chatLog("토큰 HUD: 예외 발생 (무시하고 계속) -", msg);
     }
   }
 
@@ -1804,6 +1828,16 @@
             <label></label>
             <div id="vg-token-stats-output" style="flex:1; font-size:12px; line-height:1.6;">불러오는 중...</div>
           </div>
+          <p style="font-size:11px;color:#f0b429;margin:16px 0 6px;">
+            우상단 뱃지가 안 뜬다면: RisuAI는 플러그인이 메인 화면(DOM)에 접근하려 할 때 "이 플러그인이
+            메인 문서에 접근하려고 합니다. 허용하시겠습니까?" 같은 확인창을 한 번 띄우고, 여기서 거부되었거나
+            (혹은 알아채지 못하고 넘어갔거나) 하면 이후로는 아무 표시 없이 조용히 실패합니다. 아래 버튼을 눌러서
+            지금 이 자리에서 그 확인창을 다시 띄워보고, 결과를 바로 확인하세요.
+          </p>
+          <div class="vg-row">
+            <label></label>
+            <div><button class="vg-btn" id="vg-test-hud">🔔 HUD 표시 테스트 (권한 요청)</button><span class="vg-status" id="vg-hud-test-status"></span></div>
+          </div>
         </div>
 
         <div style="margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; padding-bottom: 40px;">
@@ -2014,6 +2048,38 @@
       if (!confirm("누적된 토큰 사용량 통계를 전부 초기화할까요?")) return;
       await resetTokenStats();
       await renderTokenStatsPanel();
+    });
+
+    root.querySelector("#vg-test-hud").addEventListener("click", async () => {
+      const btn = root.querySelector("#vg-test-hud");
+      const status = root.querySelector("#vg-hud-test-status");
+      btn.disabled = true;
+      status.className = "vg-status";
+      status.textContent = "확인창이 뜨는지 지켜보세요...";
+      try {
+        await Risuai.setArgument("vg_show_token_hud", "true");
+        const doc = await withTimeout(Risuai.getRootDocument(), 15000, "getRootDocument()");
+        if (!doc) {
+          status.className = "vg-status err";
+          status.textContent = "✗ 권한이 거부되었습니다 (getRootDocument()가 null 반환). RisuAI를 새로고침한 뒤 다시 시도하면 확인창이 다시 뜰 수 있습니다.";
+          return;
+        }
+        const body = await doc.querySelector("body");
+        if (!body) {
+          status.className = "vg-status err";
+          status.textContent = "✗ 권한은 통과했지만 body 엘리먼트를 찾지 못했습니다.";
+          return;
+        }
+        const stats = await loadTokenStats();
+        await showTokenHud("테스트-모델", { input: 123, output: 45, reasoning: 0, cached: 0, total: 168 }, stats.totals.total || 168);
+        status.className = "vg-status ok";
+        status.textContent = "✓ 성공. RisuAI 화면 우상단(설정창이 위에 떠 있다면 뒤로 가려질 수 있으니 설정창을 닫고 확인)에 테스트 뱃지가 7초간 표시됩니다.";
+      } catch (e) {
+        status.className = "vg-status err";
+        status.textContent = `✗ ${e.message}`;
+      } finally {
+        btn.disabled = false;
+      }
     });
 
     root.querySelector("#vg-view-chatlog").addEventListener("click", () => {
