@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.1.1
+//@version 1.1.2
 
 // ===== Settings Arguments =====
 
@@ -963,9 +963,28 @@
     return id.startsWith("imagen-");
   }
 
+  // RisuAI only forwards real attachment bytes (image/audio/video) to a
+  // provider's fetcher if the provider declared the matching capability
+  // flag when it was registered via addProvider - otherwise RisuAI
+  // downgrades the attachment to a plain-text caption before the fetcher
+  // ever runs, which is why `msg.multimodals` showed up empty even after
+  // convertMultimodalsToParts was added. These numeric values mirror
+  // RisuAI's internal model-flag enum (hasImageInput:0, hasImageOutput:1,
+  // hasAudioInput:2, hasAudioOutput:3, hasFullSystemPrompt:6, hasStreaming:8,
+  // hasVideoInput:12).
+  const MODEL_FLAG_HAS_IMAGE_INPUT = 0;
+  const MODEL_FLAG_HAS_IMAGE_OUTPUT = 1;
+  const MODEL_FLAG_HAS_AUDIO_INPUT = 2;
+  const MODEL_FLAG_HAS_FULL_SYSTEM_PROMPT = 6;
+  const MODEL_FLAG_HAS_STREAMING = 8;
+  const MODEL_FLAG_HAS_VIDEO_INPUT = 12;
+
   async function registerModel(model) {
     const displayName = `🔷 ${model.name}`;
     _registeredModels.push({ id: model.id, name: model.name, displayName });
+    const flags = isImagenId(model.id)
+      ? [MODEL_FLAG_HAS_IMAGE_OUTPUT]
+      : [MODEL_FLAG_HAS_IMAGE_INPUT, MODEL_FLAG_HAS_AUDIO_INPUT, MODEL_FLAG_HAS_VIDEO_INPUT, MODEL_FLAG_HAS_FULL_SYSTEM_PROMPT, MODEL_FLAG_HAS_STREAMING];
     await Risuai.addProvider(
       displayName,
       async (args, abortSignal) => {
@@ -998,7 +1017,7 @@
           return { success: false, content: `[${PLUGIN_NAME}] 오류: ${e.message}` };
         }
       },
-      { tokenizer: "gpt-4" }
+      { tokenizer: "gpt-4", model: { flags } }
     );
   }
 
