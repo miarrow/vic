@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.0.9
+//@version 1.1.0
 
 // ===== Settings Arguments =====
 
@@ -1259,6 +1259,61 @@
     return FALLBACK_MODELS;
   }
 
+  // ─── Chat Image Management ──────────────────────────────────────────────────
+
+  // RisuAI embeds uploaded/generated images directly inside a message's
+  // text (Message.data) as a macro tag - {{inlay::ID}}, {{inlayed::ID}}, or
+  // {{inlayeddata::ID}} - rather than as a separate structured field.
+  const INLAY_TAG_RE = /\{\{(inlay|inlayed|inlayeddata)::(.+?)\}\}/g;
+
+  // Scans the currently open chat for messages containing an inlay tag.
+  // Returns enough context to show the user which message is which without
+  // needing to render the actual image (the plugin API doesn't expose a way
+  // to read inlay asset bytes, only the chat's own text data).
+  async function scanChatImages() {
+    const charIndex = await Risuai.getCurrentCharacterIndex();
+    const chatIndex = await Risuai.getCurrentChatIndex();
+    const chat = await Risuai.getChatFromIndex(charIndex, chatIndex);
+    if (!chat || !Array.isArray(chat.message)) {
+      throw new Error("현재 열려 있는 채팅을 찾을 수 없습니다. 채팅창을 먼저 열어주세요.");
+    }
+    const matches = [];
+    chat.message.forEach((msg, msgIndex) => {
+      const data = String(msg?.data || "");
+      let m;
+      INLAY_TAG_RE.lastIndex = 0;
+      while ((m = INLAY_TAG_RE.exec(data))) {
+        const start = Math.max(0, m.index - 30);
+        const end = Math.min(data.length, m.index + m[0].length + 30);
+        matches.push({
+          msgIndex,
+          role: msg.role,
+          tag: m[0],
+          contextSnippet: `${start > 0 ? "…" : ""}${data.slice(start, m.index)}[[이미지 태그]]${data.slice(m.index + m[0].length, end)}${end < data.length ? "…" : ""}`,
+        });
+      }
+    });
+    return { charIndex, chatIndex, matches };
+  }
+
+  // Removes ONE specific tag occurrence from ONE specific message and saves
+  // the chat back. Re-fetches the chat fresh right before writing so a
+  // stale in-memory copy can't clobber other edits made in the meantime.
+  async function removeChatImageTag(charIndex, chatIndex, msgIndex, tag) {
+    const chat = await Risuai.getChatFromIndex(charIndex, chatIndex);
+    if (!chat || !Array.isArray(chat.message) || !chat.message[msgIndex]) {
+      throw new Error("메시지를 다시 찾지 못했습니다 (그 사이 채팅이 변경되었을 수 있습니다). 목록을 새로고침해주세요.");
+    }
+    const msg = chat.message[msgIndex];
+    const data = String(msg.data || "");
+    const idx = data.indexOf(tag);
+    if (idx === -1) {
+      throw new Error("해당 이미지 태그를 메시지에서 찾지 못했습니다 (이미 제거되었을 수 있습니다).");
+    }
+    msg.data = data.slice(0, idx) + data.slice(idx + tag.length);
+    await Risuai.setChatToIndex(charIndex, chatIndex, chat);
+  }
+
   // ─── Settings UI ─────────────────────────────────────────────────────────────
 
   async function renderSettings() {
@@ -1528,6 +1583,26 @@
           </div>
         </div>
 
+        <div class="vg-section">
+          <h3>🖼 채팅 이미지 관리</h3>
+          <p style="font-size:11px;color:#888;margin:0 0 10px;">
+            현재 열려 있는 채팅에서 이미지가 첨부된 메시지를 찾아서, 뒤 메시지를 지우지 않고도
+            해당 메시지의 이미지만 바로 제거할 수 있습니다. 먼저 RisuAI에서 이미지가 포함된
+            채팅을 열어둔 상태에서 아래 버튼을 눌러주세요.
+          </p>
+          <div class="vg-row">
+            <label></label>
+            <div>
+              <button class="vg-btn" id="vg-scan-images">🔍 현재 채팅에서 이미지 찾기</button>
+              <span class="vg-status" id="vg-image-scan-status"></span>
+            </div>
+          </div>
+          <div class="vg-row">
+            <label></label>
+            <div id="vg-image-list" style="flex:1; max-height:320px; overflow-y:auto;"></div>
+          </div>
+        </div>
+
         <div style="margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; padding-bottom: 40px;">
           <button class="vg-btn" id="vg-save-btn">💾 저장</button>
           <button class="vg-btn-secondary" id="vg-reset-btn">↩ 초기화</button>
@@ -1632,6 +1707,57 @@
         out.select();
       }
     });
+
+    async function refreshImageList() {
+      const status = root.querySelector("#vg-image-scan-status");
+      const listEl = root.querySelector("#vg-image-list");
+      status.className = "vg-status";
+      status.textContent = "검색 중...";
+      try {
+        const { charIndex, chatIndex, matches } = await scanChatImages();
+        if (matches.length === 0) {
+          listEl.innerHTML = `<span style="color:#666; font-size:12px;">이 채팅에서 이미지가 포함된 메시지를 찾지 못했습니다.</span>`;
+          status.className = "vg-status ok";
+          status.textContent = "✓ 검색 완료 (이미지 없음)";
+          return;
+        }
+        listEl.innerHTML = matches.map((m, i) => `
+          <div style="border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:8px; margin-bottom:8px;">
+            <div style="font-size:11px; color:#888; margin-bottom:4px;">메시지 #${m.msgIndex} (${m.role === "user" ? "사용자" : "캐릭터"})</div>
+            <div style="font-size:12px; margin-bottom:6px; word-break:break-all;">${m.contextSnippet.replace(/</g, "&lt;")}</div>
+            <button class="vg-btn-secondary vg-remove-image-btn" data-idx="${i}" style="font-size:11px; padding:4px 10px;">🗑 이 이미지 태그 제거</button>
+          </div>
+        `).join("");
+
+        listEl.querySelectorAll(".vg-remove-image-btn").forEach(btn => {
+          btn.addEventListener("click", async () => {
+            const m = matches[Number(btn.getAttribute("data-idx"))];
+            btn.disabled = true;
+            btn.textContent = "제거 중...";
+            try {
+              await removeChatImageTag(charIndex, chatIndex, m.msgIndex, m.tag);
+              status.className = "vg-status ok";
+              status.textContent = `✓ 메시지 #${m.msgIndex}에서 이미지를 제거했습니다. RisuAI 채팅창을 새로고침(채팅 다시 열기)하면 반영됩니다.`;
+              await refreshImageList();
+            } catch (e) {
+              btn.disabled = false;
+              btn.textContent = "🗑 이 이미지 태그 제거";
+              status.className = "vg-status err";
+              status.textContent = `✗ ${e.message}`;
+            }
+          });
+        });
+
+        status.className = "vg-status ok";
+        status.textContent = `✓ 이미지 ${matches.length}개 발견`;
+      } catch (e) {
+        status.className = "vg-status err";
+        status.textContent = `✗ ${e.message}`;
+        listEl.innerHTML = "";
+      }
+    }
+
+    root.querySelector("#vg-scan-images").addEventListener("click", refreshImageList);
 
     root.querySelector("#vg-view-chatlog").addEventListener("click", () => {
       const out = root.querySelector("#vg-chatlog-output");
