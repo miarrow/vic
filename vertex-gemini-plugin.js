@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.1.0
+//@version 1.1.1
 
 // ===== Settings Arguments =====
 
@@ -328,6 +328,35 @@
     return parts;
   }
 
+  // RisuAI attaches uploaded images/audio to a chat message via a sibling
+  // `multimodals` array on the message object (NOT inside `content`), e.g.
+  // `{ role: "user", content: "...", multimodals: [{ type: "image", base64: "data:image/png;base64,..." }] }`.
+  // `prompt_chat` messages carry this field straight through, so it has to
+  // be read separately from `convertContentToParts` or attachments are
+  // silently dropped and the model only ever sees the surrounding text.
+  function convertMultimodalsToParts(multimodals) {
+    if (!Array.isArray(multimodals)) return [];
+    const parts = [];
+    for (const item of multimodals) {
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "image" || item.type === "audio" || item.type === "video") {
+        const raw = item.base64 || item.data || "";
+        if (raw.startsWith("data:")) {
+          const [header, data] = raw.split(",");
+          const mimeType = header.replace("data:", "").replace(";base64", "");
+          if (data) parts.push({ inlineData: { mimeType, data } });
+        } else if (raw) {
+          const fallbackMime = item.mimeType || (item.type === "image" ? "image/png" : item.type === "audio" ? "audio/mpeg" : "video/mp4");
+          parts.push({ inlineData: { mimeType: fallbackMime, data: raw } });
+        } else if (item.url) {
+          const fallbackMime = item.mimeType || (item.type === "image" ? "image/jpeg" : item.type === "audio" ? "audio/mpeg" : "video/mp4");
+          parts.push({ fileData: { mimeType: fallbackMime, fileUri: item.url } });
+        }
+      }
+    }
+    return parts;
+  }
+
   function ensureAlternating(contents) {
     if (!contents.length) return [];
     const result = [];
@@ -373,7 +402,7 @@
 
       sawDialogueTurn = true;
       const geminiRole = role === "assistant" ? "model" : "user";
-      const parts = convertContentToParts(msg.content);
+      const parts = [...convertContentToParts(msg.content), ...convertMultimodalsToParts(msg.multimodals)];
       if (parts.length === 0) continue;
 
       // Trailing system-role messages (an in-context note/instruction, not
@@ -599,11 +628,13 @@
     const messages = args?.prompt_chat || [];
     chatLog(`args.prompt_chat 메시지 수: ${messages.length}, args 키 목록: ${Object.keys(args || {}).join(", ")}`);
     chatLog("원본 prompt_chat 역할 순서:", messages.map(m => m?.role || "?").join(" -> "));
+    const multimodalCount = messages.reduce((n, m) => n + (Array.isArray(m?.multimodals) ? m.multimodals.length : 0), 0);
+    chatLog(`msg.multimodals 첨부 개수 합계: ${multimodalCount}`);
     const { contents, systemParts } = convertMessagesToGemini(messages, preserveSys);
     chatLog(`Gemini 형식 변환 완료: contents ${contents.length}개, systemParts ${systemParts.length}개`);
     chatLog("변환된 contents 역할 순서:", contents.map(c => c.role).join(" -> "));
     contents.forEach((c, i) => {
-      const preview = (c.parts || []).map(p => p.text ? p.text.slice(0, 80) : "(비텍스트 part)").join(" | ");
+      const preview = (c.parts || []).map(p => p.text ? p.text.slice(0, 80) : p.inlineData ? `(inlineData: ${p.inlineData.mimeType}, ${p.inlineData.data?.length || 0}자)` : p.fileData ? `(fileData: ${p.fileData.fileUri})` : "(비텍스트 part)").join(" | ");
       chatLog(`  contents[${i}] role=${c.role}: "${preview}"`);
     });
     chatLog(`  systemInstruction 미리보기 (앞 200자): "${systemParts.map(p => p.text).join(" ").slice(0, 200)}"`);
