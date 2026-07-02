@@ -1,7 +1,7 @@
 //@name Vertex_Gemini
 //@display-name 🔷 Vertex Gemini
 //@api 3.0
-//@version 1.2.0
+//@version 1.3.0
 
 // ===== Settings Arguments =====
 
@@ -15,6 +15,7 @@
 //@arg vg_dynamic_models string 동적 모델 목록 JSON (자동 관리, 수정하지 마세요)
 //@arg vg_excluded_models string 등록에서 제외할 모델 ID 목록 (콤마 구분, 자동 관리)
 //@arg vg_token_stats string 누적 토큰 사용량 통계 JSON (자동 관리, 수정하지 마세요)
+//@arg vg_show_token_hud string 채팅마다 화면 우상단에 토큰 사용량 표시 (true/false, 기본: true)
 
 // Generation Config
 //@arg vg_temperature string Temperature (0.0~2.0, 기본값: 1.0)
@@ -546,10 +547,77 @@
     m.requests += 1;
     await saveTokenStats(stats);
     chatLog(`토큰 사용량 기록: model=${modelId}, 이번 요청 input=${usage.input}/output=${usage.output}/total=${usage.total} (누적 total=${stats.totals.total}, 누적 요청수=${stats.requests})`);
+    showTokenHud(modelId, usage, stats.totals.total);
   }
 
   async function resetTokenStats() {
     await saveTokenStats({ totals: { ...EMPTY_TOKEN_TOTALS }, requests: 0, perModel: {} });
+  }
+
+  // ─── Token HUD (floating badge in RisuAI's own chat screen) ────────────────────
+
+  // Risuai.getRootDocument() hands back an async, RPC-style proxy for the
+  // MAIN app document (real DOM nodes can't cross the plugin iframe
+  // boundary), so every call here - createElement/setAttribute/setStyle/
+  // appendChild/remove - has to be awaited individually. This mirrors the
+  // exact pattern another RisuAI plugin uses for its own toast overlay.
+  const TOKEN_HUD_ATTR = "data-vg-token-hud";
+  let _tokenHudEpoch = 0;
+
+  async function showTokenHud(modelId, usage, cumulativeTotal) {
+    try {
+      const enabled = await getBoolArg("vg_show_token_hud", true);
+      if (!enabled) return;
+      const doc = await Risuai.getRootDocument();
+      if (!doc) return;
+
+      const existing = await doc.querySelector(`[${TOKEN_HUD_ATTR}]`);
+      if (existing) await existing.remove();
+
+      const body = await doc.querySelector("body");
+      if (!body) return;
+
+      const el = await doc.createElement("div");
+      await el.setAttribute(TOKEN_HUD_ATTR, "1");
+      await el.setStyle("position", "fixed");
+      await el.setStyle("top", "12px");
+      await el.setStyle("right", "12px");
+      await el.setStyle("zIndex", "99998");
+      await el.setStyle("background", "rgba(20,20,30,0.92)");
+      await el.setStyle("color", "#e8e8f0");
+      await el.setStyle("border", "1px solid rgba(126,184,247,0.4)");
+      await el.setStyle("borderRadius", "8px");
+      await el.setStyle("padding", "8px 12px");
+      await el.setStyle("fontSize", "12px");
+      await el.setStyle("fontFamily", "monospace");
+      await el.setStyle("lineHeight", "1.5");
+      await el.setStyle("boxShadow", "0 8px 20px rgba(0,0,0,0.35)");
+      await el.setStyle("opacity", "0");
+      await el.setStyle("transform", "translateY(-8px)");
+      await el.setStyle("transition", "opacity 0.25s ease, transform 0.25s ease");
+      await el.setStyle("pointerEvents", "none");
+      await el.setInnerHTML(
+        `🔷 <b>${modelId}</b><br>` +
+        `입력 ${usage.input.toLocaleString()} · 출력 ${usage.output.toLocaleString()}` +
+        (usage.reasoning ? ` · 사고 ${usage.reasoning.toLocaleString()}` : "") +
+        `<br><span style="color:#888;">누적 ${cumulativeTotal.toLocaleString()} 토큰</span>`
+      );
+      await body.appendChild(el);
+
+      const myEpoch = ++_tokenHudEpoch;
+      setTimeout(() => {
+        el.setStyle("opacity", "1").catch(() => {});
+        el.setStyle("transform", "translateY(0)").catch(() => {});
+      }, 30);
+      setTimeout(() => {
+        if (myEpoch !== _tokenHudEpoch) return; // a newer HUD already replaced this one
+        el.setStyle("opacity", "0").catch(() => {});
+        el.setStyle("transform", "translateY(-8px)").catch(() => {});
+        setTimeout(() => { if (myEpoch === _tokenHudEpoch) el.remove().catch(() => {}); }, 300);
+      }, 7000);
+    } catch (e) {
+      warn("토큰 HUD 표시 실패 (무시하고 계속):", e.message);
+    }
   }
 
   // ─── Response Parsing ─────────────────────────────────────────────────────────
@@ -1452,6 +1520,7 @@
       "vg_image_count",
       "vg_streaming",
       "vg_preserve_system",
+      "vg_show_token_hud",
       ...SAFETY_CATEGORIES.map(s => s.key),
     ];
 
@@ -1720,6 +1789,10 @@
             정확한 청구 값과는 약간 차이가 날 수 있습니다). 스트리밍/비스트리밍 실제 채팅 호출에서만 집계되며,
             위 진단 패널의 테스트 호출은 집계에서 제외됩니다.
           </p>
+          <div class="vg-row">
+            <label>채팅마다 우상단에 표시</label>
+            <select id="vg_show_token_hud"><option value="true">활성 (기본)</option><option value="false">비활성</option></select>
+          </div>
           <div class="vg-row">
             <label></label>
             <div>
